@@ -374,6 +374,105 @@ class TestLinkPluginRunner:
         assert filtered["groups"][0]["members"][0] == {"public": "p1"}
         assert filtered["groups"][0]["members"][1] == {}
 
+    def test_filter_parent_hidden_object_removed_even_if_child_visible(
+        self, runner: LinkPluginRunner
+    ) -> None:
+        span = Span(app_id="app", uid="u")
+        response_schema = {
+            "type": "object",
+            "properties": {
+                "address": {
+                    "type": "object",
+                    "properties": {
+                        "geo": {
+                            "type": "object",
+                            "x-display": False,
+                            "properties": {
+                                "lat": {"type": "string", "x-display": True},
+                                "lng": {"type": "string", "x-display": False},
+                            },
+                        }
+                    },
+                }
+            },
+            "additionalProperties": True,
+        }
+
+        payload = {"address": {"geo": {"lat": "-37.3159", "lng": "81.1496"}}}
+        filtered = runner.filter_response_by_schema(payload, response_schema, span)
+
+        assert filtered == {"address": {}}
+
+    def test_filter_parent_hidden_array_removed_even_if_items_visible(
+        self, runner: LinkPluginRunner
+    ) -> None:
+        span = Span(app_id="app", uid="u")
+        response_schema = {
+            "type": "object",
+            "properties": {
+                "address": {
+                    "type": "object",
+                    "properties": {
+                        "tags": {
+                            "type": "array",
+                            "x-display": False,
+                            "items": {"type": "string", "x-display": True},
+                        }
+                    },
+                }
+            },
+            "additionalProperties": True,
+        }
+
+        payload = {"address": {"tags": ["a", "b"]}}
+        filtered = runner.filter_response_by_schema(payload, response_schema, span)
+
+        assert filtered == {"address": {}}
+
+    def test_filter_can_restore_field_after_toggle_to_visible(
+        self, runner: LinkPluginRunner
+    ) -> None:
+        span = Span(app_id="app", uid="u")
+        payload = {"address": {"geo": {"lat": "-37.3159", "lng": "81.1496"}}}
+
+        hidden_schema = {
+            "type": "object",
+            "properties": {
+                "address": {
+                    "type": "object",
+                    "properties": {
+                        "geo": {"type": "object", "x-display": False}
+                    },
+                }
+            },
+            "additionalProperties": True,
+        }
+        visible_schema = {
+            "type": "object",
+            "properties": {
+                "address": {
+                    "type": "object",
+                    "properties": {
+                        "geo": {
+                            "type": "object",
+                            "x-display": True,
+                            "properties": {
+                                "lat": {"type": "string", "x-display": True},
+                                "lng": {"type": "string", "x-display": True},
+                            },
+                        }
+                    },
+                }
+            },
+            "additionalProperties": True,
+        }
+
+        first = runner.filter_response_by_schema(payload, hidden_schema, span)
+        second = runner.filter_response_by_schema(payload, visible_schema, span)
+
+        assert first == {"address": {}}
+        assert second["address"]["geo"] == {"lat": "-37.3159", "lng": "81.1496"}
+
 
 class TestLinkPluginFactoryParseSchemas:
     """Test LinkPluginFactory schema parsing logic (without real link service request)"""

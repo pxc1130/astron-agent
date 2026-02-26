@@ -1,25 +1,29 @@
 import asyncio
 import json
 import os
+import sys
 import time
 from base64 import b64encode
-from copy import deepcopy
-from typing import Any, ClassVar, List, Optional, Union
+from pathlib import Path
+from typing import Any, List, Optional, Union
 
 import aiohttp
 from common.otlp.trace.span import Span
 from pydantic import BaseModel, Field
-from jsonschema import Draft202012Validator
-from jsonschema.exceptions import ValidationError
 
 from agent.exceptions.plugin_exc import GetToolSchemaExc, RunToolExc
 from agent.service.plugin.base import BasePlugin, PluginResponse
 
+try:
+    from plugin.link.utils.open_api_schema.response_filter import ResponseSchemaFilter
+except ModuleNotFoundError:
+    CORE_DIR = Path(__file__).resolve().parents[3]
+    if str(CORE_DIR) not in sys.path:
+        sys.path.insert(0, str(CORE_DIR))
+    from plugin.link.utils.open_api_schema.response_filter import ResponseSchemaFilter
+
 
 class LinkPluginRunner(BaseModel):
-    HIDDEN_LEAF: ClassVar[str] = "__hidden_leaf__"
-    REMOVED: ClassVar[object] = object()
-
     app_id: str
     uid: str
     tool_id: str
@@ -106,47 +110,7 @@ class LinkPluginRunner(BaseModel):
         return ""
 
     def get_response_json_schema(self) -> dict[str, Any]:
-        """Extract response JSON schema from OpenAPI method schema.
-
-        Priority: 200/201/202/203/204/default -> remaining status codes.
-        Prefer `application/json`; fallback to the first media type that has schema.
-        """
-        responses = self.method_schema.get("responses", {})
-        if not isinstance(responses, dict):
-            return {}
-
-        preferred_status_codes = ["200", "201", "202", "203", "204", "default"]
-        response_candidates: list[dict[str, Any]] = []
-
-        for status_code in preferred_status_codes:
-            response_schema = responses.get(status_code)
-            if isinstance(response_schema, dict):
-                response_candidates.append(response_schema)
-
-        for status_code, response_schema in responses.items():
-            if (
-                status_code not in preferred_status_codes
-                and isinstance(response_schema, dict)
-            ):
-                response_candidates.append(response_schema)
-
-        for response_schema in response_candidates:
-            content = response_schema.get("content", {})
-            if not isinstance(content, dict):
-                continue
-
-            app_json_schema = content.get("application/json", {}).get("schema")
-            if isinstance(app_json_schema, dict):
-                return app_json_schema
-
-            for media_schema in content.values():
-                if not isinstance(media_schema, dict):
-                    continue
-                schema = media_schema.get("schema")
-                if isinstance(schema, dict):
-                    return schema
-
-        return {}
+        return ResponseSchemaFilter.extract_response_json_schema(self.method_schema)
 
     @classmethod
     def collect_hidden_json_paths(
@@ -154,174 +118,17 @@ class LinkPluginRunner(BaseModel):
         schema: dict[str, Any],
         current_path: Optional[list[str]] = None,
     ) -> list[list[str]]:
-        """Collect json paths where `x-display` is explicitly set to false.
-
-        Supports nested object properties and array items (`*` as array wildcard).
-        """
-        if current_path is None:
-            current_path = []
-
-        hidden_paths: list[list[str]] = []
-        x_display = schema.get("x-display")
-        if x_display is False and current_path:
-            hidden_paths.append(current_path.copy())
-
-        schema_properties = schema.get("properties", {})
-        if isinstance(schema_properties, dict):
-            for property_name, property_schema in schema_properties.items():
-                if isinstance(property_schema, dict):
-                    hidden_paths.extend(
-                        cls.collect_hidden_json_paths(
-                            property_schema,
-                            current_path + [property_name],
-                        )
-                    )
-
-        schema_items = schema.get("items")
-        if isinstance(schema_items, dict):
-            hidden_paths.extend(
-                cls.collect_hidden_json_paths(schema_items, current_path + ["*"])
-            )
-
-        return hidden_paths
-
-    @classmethod
-    def _pop_by_json_path(cls, target: Any, path_segments: list[str]) -> None:
-        """Remove value in-place by a parsed json path segment list."""
-        if not path_segments:
-            return
-
-        current_segment = path_segments[0]
-        is_last = len(path_segments) == 1
-
-        if isinstance(target, dict):
-            if current_segment not in target:
-                return
-
-            if is_last:
-                target.pop(current_segment, None)
-                return
-
-            cls._pop_by_json_path(target.get(current_segment), path_segments[1:])
-            return
-
-        if isinstance(target, list):
-            if current_segment != "*":
-                return
-
-            if is_last:
-                target.clear()
-                return
-
-            for item in target:
-                cls._pop_by_json_path(item, path_segments[1:])
+        return ResponseSchemaFilter.collect_hidden_json_paths(schema, current_path)
 
     @classmethod
     def pop_hidden_fields(
         cls, payload: Any, need_be_poped_list: list[list[str]]
     ) -> Any:
-        """Return a deep-copied payload with hidden fields removed.
-
-        Optimization: build a hidden-path trie and traverse payload once, avoiding
-        repeated full/partial traversals for every hidden path.
-
-        Rules:
-        - Empty dict/object remains `{}`
-        - Empty list/array remains `[]`
-        - Hidden primitive value is removed (not displayed)
-        """
-        filtered_payload = deepcopy(payload)
-        path_tree = cls.build_hidden_path_tree(need_be_poped_list)
-        filtered = cls.prune_payload_by_path_tree(filtered_payload, path_tree)
-        return {} if filtered is cls.REMOVED else filtered
-
-    @classmethod
-    def build_hidden_path_tree(
-        cls, hidden_paths: list[list[str]]
-    ) -> dict[str, dict[str, Any]]:
-        """Build a trie for hidden paths to support single-pass pruning."""
-        tree: dict[str, dict[str, Any]] = {}
-
-        for path_segments in hidden_paths:
-            node: dict[str, Any] = tree
-            for segment in path_segments:
-                child_node = node.get(segment)
-                if not isinstance(child_node, dict):
-                    child_node = {}
-                    node[segment] = child_node
-                node = child_node
-            node[cls.HIDDEN_LEAF] = True
-
-        return tree
-
-    @classmethod
-    def prune_payload_by_path_tree(
-        cls,
-        payload: Any,
-        path_tree: dict[str, Any],
-    ) -> Any:
-        """Prune payload by hidden-path trie in one recursive traversal."""
-        has_hidden_leaf = bool(path_tree.get(cls.HIDDEN_LEAF))
-        child_keys = [key for key in path_tree.keys() if key != cls.HIDDEN_LEAF]
-
-        if has_hidden_leaf:
-            if isinstance(payload, dict):
-                return {}
-            if isinstance(payload, list):
-                return []
-            return cls.REMOVED
-
-        if isinstance(payload, dict):
-            for field_name in list(payload.keys()):
-                field_tree = path_tree.get(field_name)
-                if not isinstance(field_tree, dict):
-                    continue
-
-                pruned_value = cls.prune_payload_by_path_tree(
-                    payload[field_name],
-                    field_tree,
-                )
-                if pruned_value is cls.REMOVED:
-                    payload.pop(field_name, None)
-                else:
-                    payload[field_name] = pruned_value
-            return payload
-
-        if isinstance(payload, list):
-            item_tree = path_tree.get("*")
-            if not isinstance(item_tree, dict):
-                return payload
-
-            kept_items: list[Any] = []
-            for item in payload:
-                pruned_item = cls.prune_payload_by_path_tree(item, item_tree)
-                if pruned_item is cls.REMOVED:
-                    continue
-                kept_items.append(pruned_item)
-
-            return kept_items
-
-        if child_keys:
-            return payload
-
-        return payload
+        return ResponseSchemaFilter.pop_hidden_fields(payload, need_be_poped_list)
 
     @staticmethod
     def validate_response(payload: Any, response_schema: dict[str, Any]) -> bool:
-        """Validate payload against response schema.
-
-        Validation failure should not block filtering for backward compatibility,
-        so this method only returns status and does not raise.
-        """
-        if not response_schema:
-            return True
-
-        try:
-            validator = Draft202012Validator(response_schema)
-            validator.validate(payload)
-            return True
-        except ValidationError:
-            return False
+        return ResponseSchemaFilter.validate_response(payload, response_schema)
 
     def filter_response_by_schema(
         self, payload: Any, response_schema: dict[str, Any], span: Span
