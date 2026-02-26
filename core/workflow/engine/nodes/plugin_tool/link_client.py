@@ -1,7 +1,8 @@
 import json
 import time
 from base64 import b64encode
-from typing import Any, Dict, List, Set, Tuple
+from copy import deepcopy
+from typing import Any, ClassVar, Dict, List, Set, Tuple
 
 from workflow.exception.e import CustomException
 from workflow.exception.errors.code_convert import CodeConvert
@@ -17,6 +18,9 @@ class Tool:
     and execution capabilities. It handles parameter assembly and HTTP communication
     with external tool services.
     """
+
+    HIDDEN_LEAF: ClassVar[str] = "__hidden_leaf__"
+    REMOVED: ClassVar[object] = object()
 
     def __init__(
         self,
@@ -168,6 +172,173 @@ class Tool:
             return b64encode(json.dumps(payload, ensure_ascii=True).encode()).decode()
         return payload
 
+    def get_response_json_schema(self) -> dict[str, Any]:
+        """Get JSON response schema from method schema responses."""
+        responses = self.method_schema.get("responses", {})
+        if not isinstance(responses, dict):
+            return {}
+
+        response_candidates: list[dict[str, Any]] = []
+        if "200" in responses and isinstance(responses.get("200"), dict):
+            response_candidates.append(responses["200"])
+
+        for response_code, response_schema in responses.items():
+            if (
+                response_code != "200"
+                and isinstance(response_code, str)
+                and response_code.startswith("2")
+                and isinstance(response_schema, dict)
+            ):
+                response_candidates.append(response_schema)
+
+        for response_schema in response_candidates:
+            content = response_schema.get("content", {})
+            if not isinstance(content, dict):
+                continue
+
+            app_json_schema = content.get("application/json", {}).get("schema")
+            if isinstance(app_json_schema, dict):
+                return app_json_schema
+
+            for media_schema in content.values():
+                if not isinstance(media_schema, dict):
+                    continue
+                schema = media_schema.get("schema")
+                if isinstance(schema, dict):
+                    return schema
+
+        return {}
+
+    @classmethod
+    def collect_hidden_json_paths(
+        cls,
+        schema: dict[str, Any],
+        current_path: list[str] | None = None,
+    ) -> list[list[str]]:
+        """Collect JSON paths where `x-display` is explicitly false."""
+        if current_path is None:
+            current_path = []
+
+        hidden_paths: list[list[str]] = []
+        x_display = schema.get("x-display")
+        if x_display is False and current_path:
+            hidden_paths.append(current_path.copy())
+
+        schema_properties = schema.get("properties", {})
+        if isinstance(schema_properties, dict):
+            for property_name, property_schema in schema_properties.items():
+                if isinstance(property_schema, dict):
+                    hidden_paths.extend(
+                        cls.collect_hidden_json_paths(
+                            property_schema,
+                            current_path + [property_name],
+                        )
+                    )
+
+        schema_items = schema.get("items")
+        if isinstance(schema_items, dict):
+            hidden_paths.extend(
+                cls.collect_hidden_json_paths(schema_items, current_path + ["*"])
+            )
+
+        return hidden_paths
+
+    @classmethod
+    def build_hidden_path_tree(
+        cls, hidden_paths: list[list[str]]
+    ) -> dict[str, dict[str, Any]]:
+        """Build a trie for hidden paths to support single-pass pruning."""
+        tree: dict[str, dict[str, Any]] = {}
+
+        for path_segments in hidden_paths:
+            node: dict[str, Any] = tree
+            for segment in path_segments:
+                child_node = node.get(segment)
+                if not isinstance(child_node, dict):
+                    child_node = {}
+                    node[segment] = child_node
+                node = child_node
+            node[cls.HIDDEN_LEAF] = True
+
+        return tree
+
+    @classmethod
+    def prune_payload_by_path_tree(
+        cls,
+        payload: Any,
+        path_tree: dict[str, Any],
+    ) -> Any:
+        """Prune payload by hidden-path trie in one recursive traversal."""
+        has_hidden_leaf = bool(path_tree.get(cls.HIDDEN_LEAF))
+        child_keys = [key for key in path_tree.keys() if key != cls.HIDDEN_LEAF]
+
+        if has_hidden_leaf:
+            if isinstance(payload, dict):
+                return {}
+            if isinstance(payload, list):
+                return []
+            return cls.REMOVED
+
+        if isinstance(payload, dict):
+            for field_name in list(payload.keys()):
+                field_tree = path_tree.get(field_name)
+                if not isinstance(field_tree, dict):
+                    continue
+
+                pruned_value = cls.prune_payload_by_path_tree(
+                    payload[field_name],
+                    field_tree,
+                )
+                if pruned_value is cls.REMOVED:
+                    payload.pop(field_name, None)
+                else:
+                    payload[field_name] = pruned_value
+            return payload
+
+        if isinstance(payload, list):
+            item_tree = path_tree.get("*")
+            if not isinstance(item_tree, dict):
+                return payload
+
+            kept_items: list[Any] = []
+            for item in payload:
+                pruned_item = cls.prune_payload_by_path_tree(item, item_tree)
+                if pruned_item is cls.REMOVED:
+                    continue
+                kept_items.append(pruned_item)
+
+            return kept_items
+
+        if child_keys:
+            return payload
+
+        return payload
+
+    @classmethod
+    def pop_hidden_fields(
+        cls, payload: Any, need_be_poped_list: list[list[str]]
+    ) -> Any:
+        """Return a deep-copied payload with hidden fields removed."""
+        filtered_payload = deepcopy(payload)
+        path_tree = cls.build_hidden_path_tree(need_be_poped_list)
+        filtered = cls.prune_payload_by_path_tree(filtered_payload, path_tree)
+        return {} if filtered is cls.REMOVED else filtered
+
+    def filter_response_by_schema(
+        self,
+        payload: Any,
+        response_schema: dict[str, Any],
+    ) -> Any:
+        """Filter tool response payload by OpenAPI schema `x-display`."""
+        if not response_schema:
+            return payload
+
+        hidden_json_paths = self.collect_hidden_json_paths(response_schema)
+        if not hidden_json_paths:
+            return payload
+
+        return self.pop_hidden_fields(payload, hidden_json_paths)
+
     async def run(
         self, action_input: dict, business_input: dict, span: Span, **kwargs: Any
     ) -> Dict[str, Any]:
@@ -316,7 +487,9 @@ class Tool:
             else:
                 # Extract and parse successful response
                 tool_response_text = link_response["payload"]["text"]["text"]
-                return json.loads(tool_response_text)
+                tool_response = json.loads(tool_response_text)
+                response_schema = self.get_response_json_schema()
+                return self.filter_response_by_schema(tool_response, response_schema)
 
 
 class Link:
